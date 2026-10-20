@@ -192,13 +192,168 @@ def plot_metric_comparison(sweep_dir, summary, show=True):
     return path
 
 
+def plot_run(run_dir):
+    """
+    Create a plot from `steps.npz` and `config.json` (no re-simulation) and save it as
+    <run_dir>/<run_dir.name>.png. 
+    
+    Tracks the following: 
+      θ₁ | h uncertainty | gradient uncertainty.
+    """
+    import json
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    run_dir = Path(run_dir)
+    if not (run_dir / "steps.npz").exists():
+        return None                                       # run crashed before its first step
+    cfg     = json.loads((run_dir / "config.json").read_text())
+    status  = json.loads((run_dir / "summary.json").read_text()).get("status", "?") if (run_dir / "summary.json").exists() else "?"
+    a       = np.load(run_dir / "steps.npz")
+    algo    = cfg["algo"]                                 # Distinguish algorithms
+    color   = ALGO_COLORS.get(algo, INK)
+    n_sig   = cfg["gp"]["n_sigma"]
+    t, th1  = a["t"], np.degrees(a["theta"][:, 0])
+
+    fig, axes = plt.subplots(1, 3 if algo != "oracle" else 1, figsize=(17, 4.6) if algo != "oracle" else (7, 4.6),
+                             facecolor=SURFACE, squeeze=False)
+    axes = axes[0]
+    for ax in axes:
+        ax.set_facecolor(SURFACE)
+        ax.grid(color=GRID, linewidth=0.8)
+        ax.tick_params(colors=INK_2, labelsize=8, length=0)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(GRID)
+        ax.set_xlabel("time [s]", color=INK_2, fontsize=9)
+
+    # (a) θ₁ tracking, ±nσ GP band, query points, safety limit
+    ax = axes[0]
+    ax.plot(t, np.degrees(a["ref"][:, 0]), "--", color=INK_2, lw=1.2, label="reference")
+    if algo != "oracle":
+        band = np.degrees(a["h_std"]) * n_sig
+        ax.fill_between(t, th1 - band, th1 + band, color=color, alpha=0.18, lw=0, label=f"±{n_sig:g}σ GP")
+        q = a["queries"]                                   # (T, M, 2)
+        if q.size:
+            ax.scatter(np.repeat(t, q.shape[1]), np.degrees(q[:, :, 0].ravel()), s=7, color=INK_2,
+                       alpha=0.3, lw=0, label="query points", zorder=1)
+    ax.plot(t, th1, color=color, lw=2, label=ALGO_LABELS.get(algo, algo), zorder=3)
+    ax.axhline(cfg["cbf"]["THETA_MAX_deg"], color="#e34948", ls="--", lw=1.2, label="θ_max")
+    ax.set_title("Joint 1 angle", loc="left", color=INK, fontsize=11)
+    ax.set_ylabel("θ₁ [deg]", color=INK_2, fontsize=9)
+    ax.legend(fontsize=8, frameon=False, loc="lower left")
+
+    if algo != "oracle":
+        # (b) value uncertainty at θ_t
+        axes[1].plot(t, a["h_std"], color=color, lw=2)
+        axes[1].set_title("h uncertainty at θ_t", loc="left", color=INK, fontsize=11)
+        axes[1].set_ylabel("posterior std of h [rad]", color=INK_2, fontsize=9)
+        axes[1].set_ylim(bottom=0)
+        # (c) gradient uncertainty at θ_t
+        axes[2].plot(t, a["grad_std"], color=color, lw=2)
+        axes[2].set_title("Gradient uncertainty at θ_t", loc="left", color=INK, fontsize=11)
+        axes[2].set_ylabel("√tr Σ_∇", color=INK_2, fontsize=9)
+        axes[2].set_ylim(bottom=0)
+
+    lam_txt = ""
+    if algo == "lambda" and a["acq_value"].size:
+        lam = a["acq_value"][:, 0]
+        lam_txt = f",  λ mean {lam.mean():.2f} [{lam.min():.2f}, {lam.max():.2f}]"
+    fail_txt = "" if status.startswith("ok") else f"   — {status[:60]} (t = {t[-1]:.2f} s)"
+    fig.suptitle(f"{ALGO_LABELS.get(algo, algo)} — {cfg['optim_type']}, M={cfg['gibo']['M']}, σₙ={cfg['noise_std']:g}, "
+                 f"θ₀ #{cfg['theta0_id']}, seed {cfg['seed']}{lam_txt}{fail_txt}", color=INK, fontsize=11)
+    fig.tight_layout()
+    path = run_dir / f"{run_dir.name}.png"
+    fig.savefig(path, dpi=120, facecolor=SURFACE)
+    plt.close(fig)                                         # free memory — hundreds of figures per sweep
+    return path
+
+
+def plot_runs(sweep_dir, workers=None):
+    """Save plot_run() for every run folder in a sweep (parallel; existing PNGs are overwritten)."""
+    run_dirs = sorted(p for p in Path(sweep_dir).iterdir() if (p / "config.json").exists())
+    workers  = workers or max(1, (os.cpu_count() or 2) * 4 // 5)
+    print(f"Plotting {len(run_dirs)} runs → {sweep_dir}  (workers={workers})")
+    done = 0
+    with mp.get_context("spawn").Pool(workers, maxtasksperchild=50) as pool:
+        for path in pool.imap_unordered(plot_run, run_dirs):
+            done += path is not None
+    print(f"Saved {done} per-run plots ({len(run_dirs) - done} skipped: no steps logged)")
+
+
+def load_time_series(sweep_dir, field):
+    """Scrape one steps.npz field from every run → (t, {(algo, noise, M): (n_runs, T) array}). Failed (shorter) runs dropped."""
+    data, t = {}, None
+    for f in Path(sweep_dir).glob("*/steps.npz"):
+        algo, _, M, noise = f.parent.name.split("_")[:4]          # e.g. gibo_SOCP_M2_n0.5_th0_s0
+        a = np.load(f)
+        if field not in a.files:                                   # e.g. grad_err in sweeps from before it was logged
+            continue
+        data.setdefault((algo, float(noise[1:]), int(M[1:])), []).append(a[field])
+        t = a["t"] if t is None or len(a["t"]) > len(t) else t
+    return t, {k: np.stack([y for y in v if len(y) == len(t)]) for k, v in data.items()}
+
+
+def plot_uncertainty_over_time(sweep_dir):
+    """Median (line) and 25–75th percentile (band) of grad_std and h_std over time per algorithm → <sweep_dir>/summary/."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_dir = Path(sweep_dir) / "summary"
+    out_dir.mkdir(exist_ok=True)
+    for field, ylabel in (("grad_std", "gradient uncertainty √tr Σ_∇"),
+                          ("grad_err", "gradient error ‖μ_∇ − ∇h‖"),
+                          ("h_std",    "h uncertainty [rad]")):
+        t, data = load_time_series(sweep_dir, field)
+        if not data:
+            print(f"  skip {field}_over_time.png — '{field}' not logged in this sweep")
+            continue
+        noises = sorted({n for (a, n, M) in data if a in PLOT_ALGOS})
+        Ms     = sorted({M for (a, n, M) in data if a in PLOT_ALGOS})
+        fig, axes = plt.subplots(len(noises), len(Ms), figsize=(6.5 * len(Ms), 3 * len(noises)), sharex=True, squeeze=False)
+        for (i, noise), (j, M) in ((a, b) for a in enumerate(noises) for b in enumerate(Ms)):
+            ax, top = axes[i, j], 0.0
+            for algo in PLOT_ALGOS:
+                q25, med, q75 = np.percentile(data[(algo, noise, M)], [25, 50, 75], axis=0)
+                ax.plot(t, med, color=ALGO_COLORS[algo], lw=2, label=ALGO_LABELS[algo])
+                ax.fill_between(t, q25, q75, color=ALGO_COLORS[algo], alpha=0.2, lw=0)
+                top = max(top, q75[5:].max())                         # ignore the t≈0 spike for the y-range
+            ax.set_ylim(0, 1.1 * top)
+            ax.set_title(f"σₙ = {noise:g}, M = {M}", loc="left", fontsize=10)
+            ax.grid(alpha=0.3)
+            if j == 0:
+                ax.set_ylabel(ylabel, fontsize=9)               # left column only — no overlap with tick labels
+        axes[0, 0].legend(frameon=False, fontsize=9)
+        fig.supxlabel("time [s]")
+        fig.suptitle(f"{ylabel} at θ_t — median (line), 25–75th percentile (band) over completed runs; lower is better",
+                     fontsize=11)
+        fig.tight_layout()
+        fig.savefig(out_dir / f"{field}_over_time.png", dpi=150)
+        plt.close(fig)
+        print(f"→ {out_dir / f'{field}_over_time.png'}")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) * 4 // 5))   # 80% of cores, rounded down (8 on this Mac): ~3.2 GB peak
     p.add_argument("--max-runs", type=int, default=None, help="only the first N runs (after ordering)")
     p.add_argument("--end-time", type=float, default=None, help="override sim end_time (smoke tests)")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--plot-runs", metavar="SWEEP_DIR", default=None,
+                   help="only saves run plots for EXISTING sweep folders, then exit")
+    p.add_argument("--time-plots", metavar="SWEEP_DIR", default=None,
+                   help="only save the median-over-time plots (summary/) for an EXISTING sweep folder, then exit")
     args = p.parse_args()
+
+    if args.plot_runs:
+        plot_runs(args.plot_runs, workers=args.workers)
+        return
+    if args.time_plots:
+        plot_uncertainty_over_time(args.time_plots)
+        return
 
     runs = list(SweepConfig().runs())
     if args.end_time is not None:
@@ -238,6 +393,14 @@ def main():
         plot_metric_comparison(sweep_dir, summary, show=False)
     elif input("Plot metric comparisons across algorithms? [Y/n] ").strip().lower() in ("", "y", "yes"):
         plot_metric_comparison(sweep_dir, summary)
+
+    # -- Per-run figures, rebuilt from each steps.npz (no re-simulation) --
+    if not sys.stdin.isatty() or input("Save per-run plots? [Y/n] ").strip().lower() in ("", "y", "yes"):
+        plot_runs(sweep_dir, workers=args.workers)
+
+    # -- Median + 25–75th percentile band over time, per algorithm → summary/ --
+    if not sys.stdin.isatty() or input("Plot median uncertainty over time? [Y/n] ").strip().lower() in ("", "y", "yes"):
+        plot_uncertainty_over_time(sweep_dir)
 
 
 if __name__ == "__main__":
