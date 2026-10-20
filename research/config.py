@@ -89,7 +89,7 @@ class SweepConfig:
     algos: tuple       = ("gibo", "random", "lambda")
     optim_type: str    = "SOCP"
     noise_stds: tuple  = (0.05, 0.2, 0.5)
-    Ms: tuple          = (1, 2)
+    Ms: tuple          = (1, 2, 3, 4)
     seeds: tuple       = (0, 1, 2)
     include_oracle: bool = True                # oracle runs once
     theta0_offsets: tuple = ((-0.025,  0.093), # 5 sets of manipulator states from scrambled Sobol

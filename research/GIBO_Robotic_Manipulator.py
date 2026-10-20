@@ -10,6 +10,7 @@ from src.helpers.gp_simple import RBF_example
 from src.core.simulation import Simulation
 from src.core.manipulator import Manipulator
 from config import RunConfig
+from src.core.logger import TRUE_GRAD_H     # true ∇h = [−1, 0] for h = θ_max − θ₁
 
 def main(cfg: RunConfig = None, logger=None):
     """logger: optional RunLogger. With a logger the run is headless (no plots) and returns the summary dict."""
@@ -176,6 +177,7 @@ def main(cfg: RunConfig = None, logger=None):
                 h_true=h_true, h_true_t=Arm.THETA_MAX - theta_t[0], h_noisy=h_noisy,
                 h_mean=h_mean, h_std=h_std, h_safe=h_safe,
                 grad_mean=np.asarray(expected_grad_ang_dist), grad_var=[np.nan, np.nan], grad_std=grad_std,
+                grad_err=np.linalg.norm(np.asarray(expected_grad_ang_dist) - TRUE_GRAD_H),   # ‖μ_∇ − ∇h‖ per step
                 queries=q, query_offset=np.linalg.norm(q - theta_t, axis=1) / cfg.gp.l_0,
                 query_h_true=Arm.THETA_MAX - q[:, 0], acq_value=acq_vals,
                 n_data=len(Arm.D["h"]),

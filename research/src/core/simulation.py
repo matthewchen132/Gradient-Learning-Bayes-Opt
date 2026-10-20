@@ -101,7 +101,19 @@ class Simulation():
             self.logs["h_std"].append(float(h_std))
         if lambda_val is not None:
             self.logs["lambda"].append(float(lambda_val))
-    def plot_acq_function(self, arm, n_sigma=2.0):
+
+    def save_figure(self, fig, save_path=None):
+        """Lay out, optionally save to save_path (PNG, parent folders created), then show."""
+        plt.tight_layout()
+        if save_path is not None:
+            from pathlib import Path
+            save_path = Path(save_path)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+            print(f"Saved plot → {save_path}")
+        plt.show()
+
+    def plot_acq_function(self, arm, n_sigma=2.0, save_path=None):
         t_arr     = np.array(self.logs["times"])
         th_arr    = np.array(self.logs["state"])
         qp_arr    = np.array(self.logs["query_points"])
