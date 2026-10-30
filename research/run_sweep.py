@@ -13,6 +13,7 @@ import argparse
 import contextlib
 import csv
 import io
+import json
 import multiprocessing as mp
 import os
 import sys
@@ -336,6 +337,141 @@ def plot_uncertainty_over_time(sweep_dir):
         print(f"→ {out_dir / f'{field}_over_time.png'}")
 
 
+def lambda_stats(sweep_dir):
+    """One row per λ run: λ range / change, query offset, grad_std and h_std reduction (within run and vs paired GIBO)."""
+    rows = []
+    for f in sorted(Path(sweep_dir).glob("lambda_*/steps.npz")):
+        _, _, M, noise = f.parent.name.split("_")[:4]
+        a = np.load(f)
+        lam = a["acq_value"][:, 0]                                       # λ is the same for all M queries in a step
+        row = dict(run=f.parent.name, noise=float(noise[1:]), M=int(M[1:]),
+                   lam_mean=lam.mean(), lam_min=lam.min(), lam_max=lam.max(), lam_range=np.ptp(lam),
+                   lam_change=np.abs(np.diff(lam)).mean(),                 # mean |Δλ| per step
+                   query_offset=a["query_offset"].mean(),                  # units of ℓ; box corner = 2√2 ≈ 2.83
+                   grad_std_drop=1 - a["grad_std"][-1] / a["grad_std"][0], # within run: 1 − final/initial
+                   h_std_drop=1 - a["h_std"][-1] / a["h_std"][0])
+        gibo = f.parent.parent / f.parent.name.replace("lambda", "gibo", 1) / "summary.json"
+        if gibo.exists():                                                # paired GIBO run: same σ, M, θ₀, seed
+            g, l = json.loads(gibo.read_text()), json.loads((f.parent / "summary.json").read_text())
+            row["grad_auc_vs_gibo"] = 1 - l["grad_std_auc"] / g["grad_std_auc"]   # > 0 → λ lower than GIBO
+            row["h_std_vs_gibo"]    = 1 - l["h_std_mean"] / g["h_std_mean"]
+        rows.append(row)
+    return rows
+
+
+LAMBDA_COLS = ("lam_mean", "lam_range", "lam_change", "query_offset",
+               "grad_std_drop", "h_std_drop", "grad_auc_vs_gibo", "h_std_vs_gibo")
+
+
+def lambda_study(sweep_dir, old_dir=None):
+    """Median λ metrics per (σ, M) → printed table + <sweep_dir>/summary/lambda_summary.csv. old_dir adds old-λ rows."""
+    sweeps = {"new": lambda_stats(sweep_dir)}
+    if old_dir:
+        sweeps["old"] = lambda_stats(old_dir)
+    out = []
+    for version, rows in sweeps.items():
+        for noise, M in sorted({(r["noise"], r["M"]) for r in rows}):
+            cell = [r for r in rows if (r["noise"], r["M"]) == (noise, M)]
+            out.append(dict(version=version, noise=noise, M=M, n=len(cell),
+                            **{c: float(np.nanmedian([r.get(c, np.nan) for r in cell])) for c in LAMBDA_COLS}))
+    out.sort(key=lambda r: (r["noise"], r["M"], r["version"]))       # old / new side by side per cell
+
+    print(f"\nλ study — medians over θ₀ × seeds  (drops / vs_gibo are fractions: > 0 = uncertainty reduced)")
+    print(f"{'ver':4s} {'σ':>5s} {'M':>2s} {'n':>3s} " + " ".join(f"{c:>16s}" for c in LAMBDA_COLS))
+    for r in out:
+        print(f"{r['version']:4s} {r['noise']:5g} {r['M']:2d} {r['n']:3d} " + " ".join(f"{r[c]:16.4f}" for c in LAMBDA_COLS))
+
+    if old_dir:                                                      # one-time comparison folder: outputs/lambda_study_<time>/
+        out_dir = OUTPUT_ROOT / f"lambda_study_{datetime.now():%Y-%m-%d_%H%M%S}"
+    else:
+        out_dir = Path(sweep_dir) / "summary"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "sources.json").write_text(json.dumps({"new": str(sweep_dir), "old": str(old_dir)}, indent=2))
+    with open(out_dir / "lambda_summary.csv", "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(out[0]))
+        w.writeheader()
+        w.writerows(out)
+    print(f"→ {out_dir / 'lambda_summary.csv'}")
+    plot_lambda_study(out_dir, {"new": sweep_dir, "old": old_dir}, sweeps)
+    return sweeps
+
+
+def plot_lambda_study(out_dir, dirs, sweeps):
+    """λ(t) median + band, per-run λ range, query-location heatmaps (old λ, new λ, GIBO) on the (σ, M) cells both share."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    style = {"new": dict(color=ALGO_COLORS["lambda"], ls="-",  label="new (min-max)"),
+             "old": dict(color=INK_2,                 ls="--", label="old (I/max → corner clipping)")}
+    from config import RunConfig
+    g = RunConfig()
+    n_grid, box = g.gibo.grid_n, g.gibo.box_factor                   # query box = ±box·ℓ around θ_t (manipulator.py:158)
+    cells = set.intersection(*({(r["noise"], r["M"]) for r in rows} for rows in sweeps.values()))
+    fig, axes = plt.subplots(1, 5, figsize=(27, 4.8), facecolor=SURFACE, gridspec_kw=dict(width_ratios=[1.4, 1.4, 1, 1, 1]))
+    heat = {}
+    for version, d in dirs.items():
+        if d is None:
+            continue
+        s = style[version]
+        # (a) λ(t): median + 25–75th percentile band over all λ runs
+        t, lam = load_time_series(d, "acq_value")
+        lam = np.concatenate([v[..., 0] for (a, n, M), v in lam.items() if a == "lambda" and (n, M) in cells])
+        q25, med, q75 = np.percentile(lam, [25, 50, 75], axis=0)
+        axes[0].plot(t, med, lw=1.8, **s)
+        axes[0].fill_between(t, q25, q75, color=s["color"], alpha=0.2, lw=0)
+        # (b) per-run λ range (min–max bar), runs ranked by mean λ
+        rows = sorted((r for r in sweeps[version] if (r["noise"], r["M"]) in cells), key=lambda r: r["lam_mean"])
+        x = np.linspace(0, 1, len(rows))                                 # rank as a fraction so old / new line up
+        axes[1].vlines(x, [r["lam_min"] for r in rows], [r["lam_max"] for r in rows], color=s["color"], alpha=0.3, lw=1)
+        axes[1].plot(x, [r["lam_mean"] for r in rows], lw=1.8, **s)
+        # (c–e) where in the grid_n × grid_n box the queries land: % of all queries per grid point
+        _, Q  = load_time_series(d, "queries")                          # (runs, T, M, 2)
+        _, TH = load_time_series(d, "theta")                            # (runs, T, 2) — same glob order, same runs
+        for algo in (("lambda", "gibo") if version == "new" else ("lambda",)):   # GIBO reference from the new sweep
+            keys = [k for k in Q if k[0] == algo and k[1:] in cells]
+            off = np.concatenate([(Q[k] - TH[k][:, :, None, :]).reshape(-1, 2) for k in keys]) / g.gp.l_0   # (q − θ_t) / ℓ
+            idx = np.rint((off + box) / (2 * box / (n_grid - 1))).astype(int).clip(0, n_grid - 1)
+            H = np.zeros((n_grid, n_grid))
+            np.add.at(H, (idx[:, 0], idx[:, 1]), 1)                     # rows = θ₁ offset, cols = θ₂ offset
+            heat["GIBO" if algo == "gibo" else f"{version} λ"] = 100 * H / H.sum()
+
+    vmax = max(H.max() for H in heat.values())
+    centers = np.linspace(-box, box, n_grid)
+    for ax, version in zip(axes[2:], ("old λ", "new λ", "GIBO")):
+        if version not in heat:
+            ax.axis("off")
+            continue
+        H = heat[version]
+        edge = H[[0, -1], :].sum() + H[1:-1][:, [0, -1]].sum()          # % of queries on the box boundary
+        e = box + box / (n_grid - 1)                                    # pad half a cell so cells centre on grid points
+        im = ax.imshow(H, origin="lower", cmap="Greens", vmin=0, vmax=vmax, extent=[-e, e, -e, e])
+        for (i, j), v in np.ndenumerate(H):
+            if v >= 1:
+                ax.text(centers[j], centers[i], f"{v:.0f}", ha="center", va="center", fontsize=7,
+                        color="white" if v > vmax / 2 else INK)
+        ax.set_title(f"{version}: {edge:.0f}% of queries on box edge", loc="left", fontsize=11)
+        ax.set_xlabel("θ₂ offset / ℓ")
+        ax.set_ylabel("θ₁ offset / ℓ   (↑ toward θ_max)")
+    fig.colorbar(im, ax=axes[4], label="% of queries", shrink=0.85)
+
+    for ax, title, xl, yl in ((axes[0], "λ(t) — median, 25–75th band", "time [s]", "λ"),
+                              (axes[1], "λ range per run (min–max), ranked by mean", "run rank (fraction)", "λ")):
+        ax.set_title(title, loc="left", fontsize=11)
+        ax.set_xlabel(xl)
+        ax.set_ylabel(yl)
+        ax.grid(alpha=0.3, color=GRID)
+        ax.set_facecolor(SURFACE)
+    axes[0].set_ylim(0, 1)
+    axes[1].set_ylim(0, 1)
+    axes[0].legend(frameon=False, fontsize=9, loc="lower right")
+    fig.suptitle(f"λ study — cells σ×M = {sorted(cells)}", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(out_dir / "lambda_study.png", dpi=150)
+    plt.close(fig)
+    print(f"→ {out_dir / 'lambda_study.png'}")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) * 4 // 5))   # 80% of cores, rounded down (8 on this Mac): ~3.2 GB peak
@@ -346,6 +482,10 @@ def main():
                    help="only saves run plots for EXISTING sweep folders, then exit")
     p.add_argument("--time-plots", metavar="SWEEP_DIR", default=None,
                    help="only save the median-over-time plots (summary/) for an EXISTING sweep folder, then exit")
+    p.add_argument("--lambda-study", metavar="SWEEP_DIR", default=None,
+                   help="only run the λ study (table + figure) for an EXISTING sweep folder, then exit")
+    p.add_argument("--compare", metavar="OLD_SWEEP_DIR", default=None,
+                   help="with --lambda-study: old-λ sweep to compare against → one-time outputs/lambda_study_<time>/")
     args = p.parse_args()
 
     if args.plot_runs:
@@ -353,6 +493,9 @@ def main():
         return
     if args.time_plots:
         plot_uncertainty_over_time(args.time_plots)
+        return
+    if args.lambda_study:
+        lambda_study(args.lambda_study, old_dir=args.compare)
         return
 
     runs = list(SweepConfig().runs())
@@ -401,6 +544,10 @@ def main():
     # -- Median + 25–75th percentile band over time, per algorithm → summary/ --
     if not sys.stdin.isatty() or input("Plot median uncertainty over time? [Y/n] ").strip().lower() in ("", "y", "yes"):
         plot_uncertainty_over_time(sweep_dir)
+
+    # -- λ range / change, query locations, uncertainty reduction vs GIBO → summary/ --
+    if not sys.stdin.isatty() or input("Run λ study? [Y/n] ").strip().lower() in ("", "y", "yes"):
+        lambda_study(sweep_dir)
 
 
 if __name__ == "__main__":
